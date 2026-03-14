@@ -1933,6 +1933,31 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+/// Enrich a user message with memory and hardware RAG context.
+/// Returns the enriched message ready for LLM consumption.
+async fn enrich_user_message_with_context(
+    user_message: &str,
+    mem: &dyn Memory, // &dyn Memory, not &Arc<dyn Memory>
+    hardware_rag: Option<&crate::rag::HardwareRag>,
+    board_names: &[String],
+    min_relevance_score: f64, // f64 to match build_context
+    compact_context: bool,
+) -> String {
+    let mem_context = build_context(mem, user_message, min_relevance_score).await;
+    let rag_limit = if compact_context { 2 } else { 5 };
+    let hw_context = hardware_rag
+        .as_ref()
+        .map(|r| build_hardware_context(r, user_message, board_names, rag_limit))
+        .unwrap_or_default();
+    let context = format!("{mem_context}{hw_context}");
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    if context.is_empty() {
+        format!("[{now}] {user_message}")
+    } else {
+        format!("{context}[{now}] {user_message}")
+    }
+}
+
 /// Helper: ensure provider can accept vision input when history contains image markers.
 fn check_vision_compat(
     provider: &dyn Provider,
@@ -2812,14 +2837,14 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
 }
 
 /// Outcome from processing a CLI slash or shell command.
-enum SlashCommandOutcome {
+pub enum SlashCommandOutcome {
     Quit,
     Continue,
 }
 
 /// Run a CLI shell command (commands starting with '!') and return combined
 /// stdout+stderr if any output was produced, otherwise `None`.
-async fn run_cli_shell_command(cmd: &str) -> Option<String> {
+pub async fn run_cli_shell_command(cmd: &str) -> Option<String> {
     // Return None if command doesn't start with '!' (not a shell command)
     if !cmd.trim_start().starts_with('!') {
         return None;
@@ -2859,7 +2884,7 @@ async fn run_cli_shell_command(cmd: &str) -> Option<String> {
 /// from the main loop to keep `run()` concise. Returns `Ok(Some(outcome))`
 /// when the input was a CLI command (slash or `!` shell); `Ok(None)` means
 /// the input should be treated as a normal user message.
-async fn process_slash_command(
+pub async fn process_slash_command(
     user_input: &str,
     history: &mut Vec<ChatMessage>,
     system_prompt: &str,
@@ -3200,27 +3225,29 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
-        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-        let hw_context = hardware_rag
-            .as_ref()
-            .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
-            .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {msg}")
-        } else {
-            format!("{context}[{now}] {msg}")
-        };
+        let enriched = enrich_user_message_with_context(
+            &msg,
+            mem.as_ref(),
+            hardware_rag.as_ref(),
+            &board_names,
+            config.memory.min_relevance_score,
+            config.agent.compact_context,
+        )
+        .await;
 
         let mut history = vec![
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
-
+        if let Some(cli_result) = run_cli_shell_command(&msg).await {
+            println!("{cli_result}");
+            return Ok(cli_result);
+        }
+        if let Some(_outcome) =
+            process_slash_command(&msg, &mut history, &system_prompt, &mem).await?
+        {
+            return Ok(msg);
+        }
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -3294,21 +3321,15 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
-            let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-            let hw_context = hardware_rag
-                .as_ref()
-                .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
-                .unwrap_or_default();
-            let context = format!("{mem_context}{hw_context}");
-            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-            let enriched = if context.is_empty() {
-                format!("[{now}] {user_input}")
-            } else {
-                format!("{context}[{now}] {user_input}")
-            };
+            let enriched = enrich_user_message_with_context(
+                &user_input,
+                mem.as_ref(),
+                hardware_rag.as_ref(),
+                &board_names,
+                config.memory.min_relevance_score,
+                config.agent.compact_context,
+            )
+            .await;
 
             history.push(ChatMessage::user(&enriched));
 
@@ -3407,6 +3428,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
+
     let mut tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -3532,24 +3554,28 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
-    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-    let hw_context = hardware_rag
-        .as_ref()
-        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
-        .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-    let enriched = if context.is_empty() {
-        format!("[{now}] {message}")
-    } else {
-        format!("{context}[{now}] {message}")
-    };
+    let enriched = enrich_user_message_with_context(
+        message,
+        mem.as_ref(),
+        hardware_rag.as_ref(),
+        &board_names,
+        config.memory.min_relevance_score,
+        config.agent.compact_context,
+    )
+    .await;
 
     let mut history = vec![
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),
     ];
+
+    if let Some(cli_result) = run_cli_shell_command(&message).await {
+        println!("process_message: {cli_result}");
+        return Ok(cli_result);
+    }
+    if let Some(_outcome) = process_slash_command(&message, &mut history, &system_prompt, &mem).await? {
+        return Ok(message.to_string());
+    }
 
     agent_turn(
         provider.as_ref(),

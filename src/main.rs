@@ -821,7 +821,7 @@ async fn main() -> Result<()> {
             peripheral,
         } => {
             let final_temperature = temperature.unwrap_or(config.default_temperature);
-
+            println!("🤖 Starting ZeroClaw Agent: {}", message.as_deref().unwrap_or("(no message)"));
             agent::run(
                 config,
                 message,
