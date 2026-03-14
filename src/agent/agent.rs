@@ -654,7 +654,7 @@ impl Agent {
         });
 
         while let Some(msg) = rx.recv().await {
-            println!("> {}", msg.content);
+            println!("run_interactive():> {}", msg.content);
             let response = match self.turn(&msg.content).await {
                 Ok(resp) => resp,
                 Err(e) => {

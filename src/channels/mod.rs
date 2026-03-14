@@ -94,6 +94,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::loop_::{run_cli_shell_command, process_slash_command};
+
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
 struct ChannelNotifyObserver {
@@ -1772,8 +1774,32 @@ async fn process_channel_message(
 
     let system_prompt =
         build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
-    let mut history = vec![ChatMessage::system(system_prompt)];
+    let mut history = vec![ChatMessage::system(&system_prompt)];
     history.extend(prior_turns);
+
+    // Early exit: CLI shell command
+    if let Some(cli_result) = run_cli_shell_command(&msg.content).await {
+        if let Some(channel) = target_channel.as_ref() {
+            let _ = channel
+                .send(
+                    &SendMessage::new(&cli_result, &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
+        append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::assistant(&cli_result));
+        return;
+    }
+
+    // Early exit: slash command
+    if process_slash_command(&msg.content, &mut history, &system_prompt, &ctx.memory)
+        .await
+        .unwrap_or(None)
+        .is_some()
+    {
+        return;
+    }
+
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
