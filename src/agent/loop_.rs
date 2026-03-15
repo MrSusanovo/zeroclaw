@@ -2016,6 +2016,17 @@ pub(crate) async fn agent_turn(
     .await
 }
 
+pub fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
+}
+
 async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -2026,7 +2037,7 @@ async fn execute_one_tool(
     let args_summary = {
         let raw = call_arguments.to_string();
         if raw.len() > 300 {
-            format!("{}…", &raw[..300])
+            format!("{}…", truncate_at_char_boundary(&raw, 300))
         } else {
             raw
         }
